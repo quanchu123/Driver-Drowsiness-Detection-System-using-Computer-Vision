@@ -6,7 +6,7 @@ Hệ thống **phát hiện buồn ngủ của tài xế theo thời gian thực
 |---|---|
 | **Môn / dự án** | DAP391 — Nhóm 3 |
 | **Nhóm** | Trần Trọng Chinh (Leader), Trần Quốc Việt, Nguyễn Danh Tám |
-| **GVHD** | Phan Duy Hùng |
+| **GVHD** | GS.TS Phan Duy Hùng |
 | **Stack** | Python · OpenCV · MediaPipe FaceLandmarker · EAR / MAR / PERCLOS |
 | **Repo** | https://github.com/quanchu123/Driver-Drowsiness-Detection-System-using-Computer-Vision |
 
@@ -249,7 +249,7 @@ Chi tiết roadmap: [`docs/IMPROVEMENT_PLAN.md`](docs/IMPROVEMENT_PLAN.md)
 | Trần Quốc Việt | Thành viên |
 | Nguyễn Danh Tám | Thành viên |
 
-**Advisor:** Phan Duy Hùng
+**Advisor:** GS.TS Phan Duy Hùng
 
 ---
 
