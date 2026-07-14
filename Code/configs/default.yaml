@@ -1,0 +1,41 @@
+# Driver Drowsiness Detection — default config
+seed: 42
+data:
+  csv_path: ../Data/drowsiness_data_shuffled.csv
+  # If true, flip Drowsy labels after audit confirms inversion vs EAR physiology
+  flip_labels: true
+  test_size: 0.15
+  val_size: 0.15
+
+features:
+  ear_closed_threshold: 0.25   # classic EAR closed eyes (realtime)
+  mar_yawn_threshold: 0.6
+  # Report baseline threshold (may not match physiology on this CSV)
+  report_ear_threshold: 0.41
+  perclos_window: 90           # frames
+  blink_min_frames: 2
+  blink_max_frames: 8
+  microsleep_min_frames: 15    # ~0.5s at 30fps
+  yawn_min_frames: 10
+
+model:
+  type: xgboost                # logistic | rf | xgboost
+  class_weight: balanced
+  output_dir: artifacts
+
+realtime:
+  camera_id: 0
+  width: 640
+  height: 480
+  use_clahe: true
+  # State machine
+  suspicious_frames: 8
+  drowsy_frames: 20
+  alert_cooldown_frames: 60
+  adaptive_calibration_seconds: 30
+
+paths:
+  model_path: artifacts/best_model.joblib
+  metrics_path: artifacts/metrics.json
+  audit_path: artifacts/label_audit.json
+  face_landmarker_model: models/face_landmarker.task

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+artifacts/*.joblib
+artifacts/*.json
+models/*.task
+!models/.gitkeep
+.ipynb_checkpoints/
+*.log
