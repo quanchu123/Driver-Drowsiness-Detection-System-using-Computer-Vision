@@ -1,41 +1,41 @@
-# Driver Drowsiness Detection — default config
+# Optimized realtime config — geometry only (no model training required)
 seed: 42
-data:
-  csv_path: ../Data/drowsiness_data_shuffled.csv
-  # If true, flip Drowsy labels after audit confirms inversion vs EAR physiology
-  flip_labels: true
-  test_size: 0.15
-  val_size: 0.15
 
 features:
-  ear_closed_threshold: 0.25   # classic EAR closed eyes (realtime)
-  mar_yawn_threshold: 0.6
-  # Report baseline threshold (may not match physiology on this CSV)
-  report_ear_threshold: 0.41
-  perclos_window: 90           # frames
+  # Base closed-eye EAR before adaptive calibration finishes
+  ear_closed_threshold: 0.22
+  mar_yawn_threshold: 0.55
+  perclos_threshold: 0.35
+  nod_threshold: 1.35
+  score_evidence_threshold: 0.45
+  perclos_window: 60            # frames (~2s @ 30fps) — shorter = more responsive
   blink_min_frames: 2
-  blink_max_frames: 8
-  microsleep_min_frames: 15    # ~0.5s at 30fps
-  yawn_min_frames: 10
-
-model:
-  type: xgboost                # logistic | rf | xgboost
-  class_weight: balanced
-  output_dir: artifacts
+  blink_max_frames: 7
+  microsleep_min_frames: 12     # ~0.4s sustained closure
+  yawn_min_frames: 8
 
 realtime:
   camera_id: 0
   width: 640
   height: 480
-  use_clahe: true
-  # State machine
-  suspicious_frames: 8
-  drowsy_frames: 20
-  alert_cooldown_frames: 60
-  adaptive_calibration_seconds: 30
+  # Inference resolution (downscale) — biggest FPS win
+  detect_width: 480
+  # Process landmarks every N frames (1=every frame; 2≈2x speed)
+  process_every_n: 1
+  use_clahe: true               # only applied when scene is dark
+  draw_landmarks: true
+  ema_alpha: 0.35               # landmark jitter smoothing
+  # Adaptive EAR: thr = open_baseline * ear_closed_ratio
+  adaptive_calibration_seconds: 20
+  ear_closed_ratio: 0.72
+  # Multi-cue state machine (score 0–1)
+  suspicious_score: 0.35
+  drowsy_score: 0.55
+  alert_score: 0.70
+  suspicious_frames: 6
+  drowsy_frames: 15
+  alert_frames: 22
+  alert_cooldown_frames: 45
 
 paths:
-  model_path: artifacts/best_model.joblib
-  metrics_path: artifacts/metrics.json
-  audit_path: artifacts/label_audit.json
   face_landmarker_model: models/face_landmarker.task

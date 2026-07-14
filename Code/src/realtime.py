@@ -1,4 +1,11 @@
-"""Realtime webcam drowsiness detection with state machine + optional ML model."""
+"""
+Realtime drowsiness detection — optimized geometry path (no ML training).
+
+Pipeline:
+  capture → (optional downscale) → night-aware preprocess → FaceLandmarker VIDEO
+  → EMA-smoothed EAR/MAR/nod → PERCLOS/blink window → multi-cue score
+  → state machine alert
+"""
 
 from __future__ import annotations
 
@@ -12,7 +19,6 @@ from pathlib import Path
 from typing import Deque, Optional
 
 import cv2
-import joblib
 import numpy as np
 import yaml
 
@@ -20,9 +26,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.features import TemporalFeatureBuffer, frame_features_from_landmarks
+from src.features import (
+    EMASmoother,
+    TemporalFeatureBuffer,
+    drowsiness_score,
+    frame_features_from_landmarks,
+)
 from src.landmarks import FaceMeshExtractor
-from src.preprocess import preprocess_frame
+from src.preprocess import preprocess_frame, resize_for_detect
 
 
 class State(str, Enum):
@@ -34,70 +45,99 @@ class State(str, Enum):
 
 @dataclass
 class AlarmStateMachine:
-    """Reduce false alarms: require sustained evidence before ALERT."""
+    """Hysteresis + cooldown to cut false alarms from blinks."""
 
-    suspicious_frames: int = 8
-    drowsy_frames: int = 20
-    alert_cooldown_frames: int = 60
+    suspicious_score: float = 0.35
+    drowsy_score: float = 0.55
+    alert_score: float = 0.70
+    suspicious_frames: int = 6
+    drowsy_frames: int = 15
+    alert_frames: int = 22
+    alert_cooldown_frames: int = 45
+    # decay when evidence drops
+    decay: int = 2
     state: State = State.NORMAL
-    _low_run: int = 0
+    _run: int = 0
     _cooldown: int = 0
 
-    def update(self, evidence: bool) -> State:
-        """
-        evidence=True means current frame/window looks drowsy
-        (low EAR / high model score / high PERCLOS).
-        """
+    def update(self, score: float) -> State:
         if self._cooldown > 0:
             self._cooldown -= 1
-            self.state = State.ALERT if self._cooldown > self.alert_cooldown_frames // 2 else State.NORMAL
+            self.state = (
+                State.ALERT
+                if self._cooldown > self.alert_cooldown_frames // 2
+                else State.NORMAL
+            )
             if self._cooldown == 0:
+                self._run = 0
                 self.state = State.NORMAL
-                self._low_run = 0
             return self.state
 
-        if evidence:
-            self._low_run += 1
+        if score >= self.suspicious_score:
+            self._run += 1
         else:
-            self._low_run = max(0, self._low_run - 2)
+            self._run = max(0, self._run - self.decay)
 
-        if self._low_run >= self.drowsy_frames:
+        if score >= self.alert_score and self._run >= self.alert_frames:
             self.state = State.ALERT
             self._cooldown = self.alert_cooldown_frames
-            self._low_run = 0
-        elif self._low_run >= self.suspicious_frames:
+            self._run = 0
+        elif score >= self.drowsy_score and self._run >= self.drowsy_frames:
+            self.state = State.DROWSY
+        elif score >= self.suspicious_score and self._run >= self.suspicious_frames:
             self.state = State.SUSPICIOUS
         else:
             self.state = State.NORMAL
         return self.state
 
+    def reset(self) -> None:
+        self.state = State.NORMAL
+        self._run = 0
+        self._cooldown = 0
+
 
 @dataclass
 class AdaptiveEARCalibrator:
-    """Per-driver EAR baseline during first N seconds (adaptable EAR idea)."""
+    """
+    Personal open-eye EAR → closed threshold.
+    Uses robust stats; updates lightly after calibration (slow drift).
+    """
 
-    calibration_seconds: float = 30.0
-    _samples: Deque[float] = field(default_factory=lambda: deque(maxlen=900))
+    calibration_seconds: float = 20.0
+    closed_ratio: float = 0.72  # thr = open_baseline * ratio
+    min_samples: int = 40
+    _samples: Deque[float] = field(default_factory=lambda: deque(maxlen=600))
     _start: Optional[float] = None
-    baseline: Optional[float] = None
+    open_baseline: Optional[float] = None
+    threshold: Optional[float] = None
 
     def update(self, ear: float, now: Optional[float] = None) -> Optional[float]:
         now = now or time.time()
         if self._start is None:
             self._start = now
-        if self.baseline is not None:
-            return self.baseline
-        self._samples.append(ear)
-        if now - self._start >= self.calibration_seconds and len(self._samples) > 30:
-            # Use lower quantile of open-eye distribution as personal closed threshold
-            arr = np.array(self._samples)
-            self.baseline = float(np.percentile(arr, 35) * 0.75)
-            return self.baseline
-        return None
+
+        # During calibration only keep higher EAR (likely open eyes)
+        if self.threshold is None:
+            self._samples.append(ear)
+            if (
+                now - self._start >= self.calibration_seconds
+                and len(self._samples) >= self.min_samples
+            ):
+                arr = np.asarray(self._samples, dtype=np.float64)
+                # Robust open-eye level: 60th percentile of samples
+                self.open_baseline = float(np.percentile(arr, 60))
+                self.threshold = max(0.12, min(0.35, self.open_baseline * self.closed_ratio))
+            return self.threshold
+
+        # Slow adapt: only when clearly open (ear well above thr)
+        if ear > self.threshold * 1.25 and self.open_baseline is not None:
+            self.open_baseline = 0.995 * self.open_baseline + 0.005 * ear
+            self.threshold = max(0.12, min(0.35, self.open_baseline * self.closed_ratio))
+        return self.threshold
 
     @property
     def done(self) -> bool:
-        return self.baseline is not None
+        return self.threshold is not None
 
 
 def load_config(path: Path) -> dict:
@@ -106,13 +146,13 @@ def load_config(path: Path) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Realtime drowsiness detection")
+    parser = argparse.ArgumentParser(description="Optimized realtime drowsiness detection (no ML train)")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--camera", type=int, default=None)
-    parser.add_argument("--video", default=None, help="Optional video file instead of camera")
-    parser.add_argument("--model", default=None, help="Path to best_model.joblib (optional)")
-    parser.add_argument("--no-display", action="store_true", help="Headless: process N frames then exit")
-    parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0=infinite)")
+    parser.add_argument("--video", default=None)
+    parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--no-draw", action="store_true", help="Skip landmark overlay (faster)")
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -122,14 +162,6 @@ def main() -> None:
     rt = cfg.get("realtime", {})
     feat_cfg = cfg.get("features", {})
 
-    model_pack = None
-    model_path = Path(args.model) if args.model else ROOT / cfg.get("paths", {}).get("model_path", "artifacts/best_model.joblib")
-    if model_path.is_file():
-        model_pack = joblib.load(model_path)
-        print(f"Loaded model: {model_path}")
-    else:
-        print("No trained model found — using EAR/MAR rules only")
-
     cam_id = args.camera if args.camera is not None else int(rt.get("camera_id", 0))
     src = args.video if args.video else cam_id
     cap = cv2.VideoCapture(src)
@@ -137,37 +169,74 @@ def main() -> None:
         print(f"ERROR: cannot open video source {src}")
         sys.exit(1)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(rt.get("width", 640)))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(rt.get("height", 480)))
+    width = int(rt.get("width", 640))
+    height = int(rt.get("height", 480))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    # Reduce camera buffer latency when supported
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    extractor = FaceMeshExtractor()
-    temporal = TemporalFeatureBuffer(
-        ear_closed_threshold=float(feat_cfg.get("ear_closed_threshold", 0.25)),
-        mar_yawn_threshold=float(feat_cfg.get("mar_yawn_threshold", 0.6)),
-        window=int(feat_cfg.get("perclos_window", 90)),
-        blink_min_frames=int(feat_cfg.get("blink_min_frames", 2)),
-        blink_max_frames=int(feat_cfg.get("blink_max_frames", 8)),
-        microsleep_min_frames=int(feat_cfg.get("microsleep_min_frames", 15)),
-        yawn_min_frames=int(feat_cfg.get("yawn_min_frames", 10)),
+    detect_width = int(rt.get("detect_width", 480))
+    process_every = max(1, int(rt.get("process_every_n", 1)))
+    use_clahe = bool(rt.get("use_clahe", True))
+    draw = not args.no_draw and bool(rt.get("draw_landmarks", True))
+
+    model_path = cfg.get("paths", {}).get("face_landmarker_model")
+    if model_path and not Path(model_path).is_absolute():
+        model_path = str((ROOT / model_path).resolve())
+    extractor = FaceMeshExtractor(
+        model_path=model_path if model_path and Path(model_path).is_file() else None,
+        video_mode=True,
     )
+
+    ear_thr_default = float(feat_cfg.get("ear_closed_threshold", 0.22))
+    mar_thr = float(feat_cfg.get("mar_yawn_threshold", 0.55))
+    perclos_thr = float(feat_cfg.get("perclos_threshold", 0.35))
+    score_thr = float(feat_cfg.get("score_evidence_threshold", 0.45))
+
+    temporal = TemporalFeatureBuffer(
+        ear_closed_threshold=ear_thr_default,
+        mar_yawn_threshold=mar_thr,
+        nod_threshold=float(feat_cfg.get("nod_threshold", 1.35)),
+        window=int(feat_cfg.get("perclos_window", 60)),
+        blink_min_frames=int(feat_cfg.get("blink_min_frames", 2)),
+        blink_max_frames=int(feat_cfg.get("blink_max_frames", 7)),
+        microsleep_min_frames=int(feat_cfg.get("microsleep_min_frames", 12)),
+        yawn_min_frames=int(feat_cfg.get("yawn_min_frames", 8)),
+    )
+    smoother = EMASmoother(alpha=float(rt.get("ema_alpha", 0.35)))
     sm = AlarmStateMachine(
-        suspicious_frames=int(rt.get("suspicious_frames", 8)),
-        drowsy_frames=int(rt.get("drowsy_frames", 20)),
-        alert_cooldown_frames=int(rt.get("alert_cooldown_frames", 60)),
+        suspicious_score=float(rt.get("suspicious_score", 0.35)),
+        drowsy_score=float(rt.get("drowsy_score", 0.55)),
+        alert_score=float(rt.get("alert_score", 0.70)),
+        suspicious_frames=int(rt.get("suspicious_frames", 6)),
+        drowsy_frames=int(rt.get("drowsy_frames", 15)),
+        alert_frames=int(rt.get("alert_frames", 22)),
+        alert_cooldown_frames=int(rt.get("alert_cooldown_frames", 45)),
     )
     calibrator = AdaptiveEARCalibrator(
-        calibration_seconds=float(rt.get("adaptive_calibration_seconds", 30))
+        calibration_seconds=float(rt.get("adaptive_calibration_seconds", 20)),
+        closed_ratio=float(rt.get("ear_closed_ratio", 0.72)),
     )
-
-    use_clahe = bool(rt.get("use_clahe", True))
-    ear_thr = float(feat_cfg.get("ear_closed_threshold", 0.25))
-    mar_thr = float(feat_cfg.get("mar_yawn_threshold", 0.6))
 
     fps_t0 = time.time()
     fps_n = 0
     fps = 0.0
     frame_i = 0
-    print("Controls: q=quit | r=reset temporal buffer")
+    t0_wall = time.time()
+    # cache last good detection when skipping frames
+    last = {
+        "ear": None,
+        "mar": None,
+        "nod": None,
+        "perclos": 0.0,
+        "score": 0.0,
+        "parts": {},
+        "pts": None,
+    }
+
+    print("Optimized realtime (geometry only — no ML train)")
+    print("Controls: q=quit | r=reset | d=toggle draw")
 
     try:
         while True:
@@ -175,77 +244,125 @@ def main() -> None:
             if not ok:
                 break
             frame_i += 1
-            frame = preprocess_frame(frame, use_clahe=use_clahe)
+            now = time.time()
+            ts_ms = int((now - t0_wall) * 1000)
 
-            pts, face_lm = extractor.process(frame)
-            evidence = False
-            ear = mar = None
-            perclos = 0.0
-            model_score = None
+            run_detect = (frame_i % process_every == 0) or last["ear"] is None
 
-            if pts is not None:
-                ff = frame_features_from_landmarks(pts, frame.shape)
-                ear, mar = ff["EAR"], ff["MAR"]
-                thr = calibrator.update(ear) or ear_thr
-                temporal.ear_closed_threshold = thr
-                tf = temporal.update(ear, mar)
-                perclos = tf["PERCLOS"]
+            if run_detect:
+                # Downscale for detector, keep full frame for display
+                small, inv_scale = resize_for_detect(frame, max_width=detect_width)
+                small = preprocess_frame(
+                    small,
+                    use_clahe=use_clahe,
+                    auto_night=True,
+                    always_clahe=False,
+                )
+                pts_small, _ = extractor.process(small, timestamp_ms=ts_ms)
 
-                # Rule evidence
-                rule_drowsy = (ear < thr) or (mar > mar_thr) or (perclos > 0.4)
-                evidence = rule_drowsy
-
-                # Optional ML on EAR, MAR (CSV-trained features)
-                if model_pack is not None:
-                    cols = model_pack["feature_cols"]
-                    vec = []
-                    for c in cols:
-                        if c == "EAR":
-                            vec.append(ear)
-                        elif c == "MAR":
-                            vec.append(mar)
-                        else:
-                            vec.append(ff.get(c, tf.get(c, 0.0)))
-                    X = np.array([vec], dtype=np.float64)
-                    model = model_pack["model"]
-                    if hasattr(model, "predict_proba"):
-                        model_score = float(model.predict_proba(X)[0, 1])
+                if pts_small is not None:
+                    # map landmarks back to full-res if needed
+                    if inv_scale != 1.0:
+                        pts = pts_small.copy()
+                        pts[:, 0] *= inv_scale
+                        pts[:, 1] *= inv_scale
+                        pts[:, 2] *= inv_scale
                     else:
-                        model_score = float(model.predict(X)[0])
-                    evidence = evidence or (model_score >= 0.5)
+                        pts = pts_small
 
-                if face_lm is not None:
-                    frame = extractor.draw(frame, face_lm)
+                    ff = frame_features_from_landmarks(pts, compute_pose=False)
+                    ear_r, mar_r, nod_r = ff["EAR"], ff["MAR"], ff["nod"]
+                    ear, mar, nod = smoother.update(ear_r, mar_r, nod_r)
 
-            state = sm.update(evidence)
+                    thr = calibrator.update(ear, now=now) or ear_thr_default
+                    temporal.ear_closed_threshold = thr
+                    tf = temporal.update(ear, mar, nod)
 
-            # Overlay
+                    score, parts = drowsiness_score(
+                        ear=ear,
+                        mar=mar,
+                        perclos=tf["PERCLOS"],
+                        closed_run=tf["closed_run"],
+                        yawn_run=tf["yawn_run"],
+                        nod_run=tf["nod_run"],
+                        ear_thr=thr,
+                        mar_thr=mar_thr,
+                        perclos_thr=perclos_thr,
+                    )
+                    last.update(
+                        ear=ear,
+                        mar=mar,
+                        nod=nod,
+                        perclos=tf["PERCLOS"],
+                        score=score,
+                        parts=parts,
+                        pts=pts,
+                        thr=thr,
+                        closed_run=tf["closed_run"],
+                    )
+                else:
+                    # face lost → decay score
+                    last["score"] = max(0.0, last["score"] * 0.85)
+                    last["pts"] = None
+
+            score = float(last["score"])
+            state = sm.update(score)
+
+            # Overlay on original frame
             color = {
                 State.NORMAL: (0, 200, 0),
                 State.SUSPICIOUS: (0, 200, 255),
                 State.DROWSY: (0, 140, 255),
                 State.ALERT: (0, 0, 255),
             }[state]
+
+            if draw and last.get("pts") is not None:
+                extractor.draw_keypoints(frame, last["pts"], color=color)
+
+            thr_s = last.get("thr", ear_thr_default)
             lines = [
                 f"State: {state.value}",
-                f"EAR: {ear:.3f}" if ear is not None else "EAR: --",
-                f"MAR: {mar:.3f}" if mar is not None else "MAR: --",
-                f"PERCLOS: {perclos:.2f}",
-                f"EAR_thr: {temporal.ear_closed_threshold:.3f} cal={'OK' if calibrator.done else '...'}",
+                f"Score: {score:.2f}",
+                f"EAR: {last['ear']:.3f}" if last["ear"] is not None else "EAR: --",
+                f"MAR: {last['mar']:.3f}" if last["mar"] is not None else "MAR: --",
+                f"PERCLOS: {last['perclos']:.2f}",
+                f"EAR_thr: {thr_s:.3f} cal={'OK' if calibrator.done else '...'}",
                 f"FPS: {fps:.1f}",
             ]
-            if model_score is not None:
-                lines.append(f"ML score: {model_score:.2f}")
             for i, text in enumerate(lines):
                 cv2.putText(
-                    frame, text, (10, 28 + i * 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA,
+                    frame,
+                    text,
+                    (10, 26 + i * 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2,
+                    cv2.LINE_AA,
                 )
+
+            # score bar
+            bar_w = int(200 * score)
+            cv2.rectangle(frame, (10, frame.shape[0] - 30), (210, frame.shape[0] - 12), (40, 40, 40), -1)
+            cv2.rectangle(
+                frame,
+                (10, frame.shape[0] - 30),
+                (10 + bar_w, frame.shape[0] - 12),
+                color,
+                -1,
+            )
+
             if state == State.ALERT:
-                cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), (0, 0, 255), 6)
+                cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), (0, 0, 255), 5)
                 cv2.putText(
-                    frame, "DROWSINESS ALERT!", (40, frame.shape[0] - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA,
+                    frame,
+                    "DROWSINESS ALERT!",
+                    (30, frame.shape[0] - 45),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 0, 255),
+                    3,
+                    cv2.LINE_AA,
                 )
 
             fps_n += 1
@@ -261,13 +378,10 @@ def main() -> None:
                     break
                 if key == ord("r"):
                     temporal.reset()
-                    sm = AlarmStateMachine(
-                        suspicious_frames=sm.suspicious_frames,
-                        drowsy_frames=sm.drowsy_frames,
-                        alert_cooldown_frames=sm.alert_cooldown_frames,
-                    )
-            elif args.max_frames and frame_i >= args.max_frames:
-                break
+                    smoother.reset()
+                    sm.reset()
+                if key == ord("d"):
+                    draw = not draw
             if args.max_frames and frame_i >= args.max_frames:
                 break
     finally:

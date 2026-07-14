@@ -1,86 +1,57 @@
-# Code — Driver Drowsiness Detection
+# Code — Driver Drowsiness Detection (optimized, no train)
 
-Pipeline: **MediaPipe FaceMesh → EAR/MAR (+ temporal PERCLOS/blink) → ML (LR/RF/XGBoost) → realtime state machine**.
+Pipeline realtime **không train model**:
 
-Aligned with optimization plan 2025–2026 (geometry core first; YOLO/Transformer optional later).
+```
+Camera → downscale → night preprocess → MediaPipe FaceLandmarker (VIDEO)
+      → EMA(EAR/MAR/nod) → PERCLOS/blink/microsleep
+      → multi-cue score → state machine alert
+```
 
 ## Setup
 
 ```bash
-# Prefer venv in home if project drive is noexec:
 python3 -m venv ~/.venvs/drowsiness-dds
 source ~/.venvs/drowsiness-dds/bin/activate
-pip install -r requirements.txt
-
+pip install -r requirements.txt   # numpy opencv mediapipe pyyaml (không cần xgboost)
 cd Code
 ```
 
-## 1) Audit labels
-
-```bash
-python -m src.audit_labels
-# → artifacts/label_audit.json
-```
-
-Raw CSV often has **inverted** EAR↔Drowsy relationship vs physiology.
-Default training **flips** labels (`configs/default.yaml` → `data.flip_labels: true`).
-
-> **Important:** After flip, EAR alone almost perfectly separates classes
-> (`ear_gt` threshold scan ≈ 100% on raw labels). Labels look **rule-derived from EAR**,
-> so train/test F1≈1.0 is **not** real-world proof. Always validate with webcam / public video.
-
-## 2) Train
-
-```bash
-python -m src.train --config configs/default.yaml
-# models: --model logistic | rf | xgboost
-```
-
-Outputs:
-- `artifacts/best_model.joblib`
-- `artifacts/metrics.json`
-- `artifacts/label_audit.json`
-
-## 3) Realtime demo
+## Chạy realtime
 
 ```bash
 python -m src.realtime --config configs/default.yaml
-# or video file:
-python -m src.realtime --video path/to/video.mp4
-# headless smoke:
-python -m src.realtime --no-display --max-frames 30 --video path.mp4
+# video file:
+python -m src.realtime --video path/to/clip.mp4
+# nhanh hơn (không vẽ landmark):
+python -m src.realtime --no-draw
 ```
 
-Keys: `q` quit · `r` reset buffer.
+Phím: `q` thoát · `r` reset buffer · `d` bật/tắt vẽ landmark.
 
-## Layout
+## Tối ưu đã áp dụng
+
+| Mục | Cách |
+|-----|------|
+| FPS | `detect_width: 480`, VIDEO mode tracking, sparse landmark draw |
+| Night | CLAHE **chỉ khi tối** (không CLAHE mọi frame) |
+| Jitter | EMA smooth EAR/MAR |
+| Adaptive EAR | calibrate 20s → threshold theo người |
+| Multi-cue | score = eye + PERCLOS + microsleep + yawn + head-nod |
+| False alarm | state machine + cooldown (không alert 1 blink) |
+| CPU feature | EAR/MAR float thuần, không solvePnP mỗi frame |
+
+Tune trong `configs/default.yaml` → block `realtime` / `features`.
+
+## Cấu trúc
 
 ```
 src/
-  landmarks.py      MediaPipe FaceMesh
-  features.py       EAR, MAR, PERCLOS, blink, head pose
-  preprocess.py     CLAHE / low-light
-  dataset.py        load + stratified split
-  audit_labels.py   label inversion check
-  models/classic.py LR, RF, XGBoost
-  train.py          train + metrics
-  evaluate.py       metrics helpers
-  realtime.py       webcam + state machine
+  realtime.py      entry realtime (chính)
+  landmarks.py     FaceLandmarker VIDEO
+  features.py      EAR/MAR/PERCLOS/score
+  preprocess.py    CLAHE có điều kiện
 configs/default.yaml
 ```
 
-## Config notes
-
-| Key | Meaning |
-|-----|---------|
-| `data.flip_labels` | Invert Drowsy after audit |
-| `features.ear_closed_threshold` | Realtime eye-closed EAR |
-| `realtime.suspicious_frames` / `drowsy_frames` | State machine hysteresis |
-| `realtime.adaptive_calibration_seconds` | Personal EAR baseline |
-
-## Next (Phase 2+)
-
-- BiLSTM/TCN sequence models
-- ONNX export
-- Optional YOLOv11n path
-- SHAP / Grad-CAM XAI
+Script `train.py` / `audit_labels.py` vẫn nằm trong repo nếu cần phân tích CSV sau — **không bắt buộc** cho demo.
